@@ -3,7 +3,10 @@
 # Description: Configure and start captive portal on lan interfaces
 # Purpose: Display educational captive portal page with no additional configuration
 # Author: spencershepard (GRIMM)
-# Version: 1.0
+# Version: 1.1
+
+# IMPORTANT!  As of Pager Firware 1.0.4 the opkg source list is broken with a missing repository.  
+# To fix, comment out or remove the offending line (Hak5) in /etc/opkg/distfeeds.conf before installing packages.
 
 # EDUCATIONAL USE
 # For educational purposes, this payload provides a simple captive portal setup
@@ -31,7 +34,6 @@
 
 # Todo:
 #   - add portal directory name to credentials log for easier identification
-#   - ignore 'captiveportal' directory when scanning for portals
 
 BRIDGE_MASTER="br-lan"
 PORTAL_IP="172.16.52.1"
@@ -40,7 +42,7 @@ PAYLOAD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Check if nginx is installed
 if ! command -v nginx >/dev/null 2>&1; then
-    LOG "[WARNING] nginx is not installed."
+    LOG yellow "[WARNING] nginx is not installed."
     resp=$(CONFIRMATION_DIALOG "Install nginx now?")
     case $? in
         $DUCKYSCRIPT_REJECTED|$DUCKYSCRIPT_ERROR)
@@ -71,7 +73,7 @@ LOG "Scanning for portal directories in $PORTAL_ROOT..."
 for d in "$PORTAL_ROOT"/*/; do
     [ -e "$d" ] || continue  # Skip if glob didn't match anything
     dname=$(basename "$d")
-    if [ -d "$d" ] && [ "$dname" != "default" ]; then
+    if [ -d "$d" ] && [ "$dname" != "default" ] && [ "$dname" != "captiveportal" ]; then
         DIRS+=("$dname")
     fi
 done
@@ -100,10 +102,34 @@ if [ "$SELECTED_DIR" = "default" ]; then
         chmod 644 $PORTAL_ROOT/default/index.html
         LOG "  Installed default portal page"
     else
-        LOG "  ERROR: default_portal.html not found in payload directory"
+        LOG red "  [ERROR]: default_portal.html not found in payload directory"
         exit 1
     fi
 fi
+
+# Function to configure PHP for captive portal use
+configure_php() {
+    LOG "  Configuring PHP for captive portal..."
+    
+    # Disable doc_root restriction (causes "No input file specified")
+    if grep -q '^doc_root = "/www"' /etc/php.ini 2>/dev/null; then
+        sed -i 's/^doc_root = "\/www"/doc_root =/' /etc/php.ini
+        LOG "  Disabled doc_root restriction in php.ini"
+    fi
+    
+    # Disable cgi.force_redirect (also causes "No input file specified")
+    mkdir -p /etc/php8
+    cat > /etc/php8/99-custom.ini << 'PHPINI'
+cgi.force_redirect = 0
+cgi.fix_pathinfo = 1
+PHPINI
+    LOG "  Created /etc/php8/99-custom.ini"
+    
+    # Restart PHP-FPM to apply configuration changes
+    LOG "  Restarting PHP-FPM to apply changes..."
+    /etc/init.d/php8-fpm restart 2>/dev/null || /etc/init.d/php-fpm restart 2>/dev/null || true
+    sleep 1
+}
 
 # Check for PHP files in portal directory
 PHP_REQUIRED=0
@@ -116,64 +142,34 @@ if [ -n "$PHP_FILES" ]; then
     
     # Check if php8-fpm is installed
     if ! which php-fpm >/dev/null 2>&1 && ! ls /usr/bin/php-fpm* >/dev/null 2>&1 && ! opkg list-installed | grep -q php8-fpm; then
-        LOG "[WARNING] php-fpm is not installed. PHP files will not work."
+        LOG yellow "[WARNING] php-fpm is not installed. PHP files will not work."
         resp=$(CONFIRMATION_DIALOG "Install PHP (php8 + php8-fpm) now?")
         case $? in
             $DUCKYSCRIPT_REJECTED|$DUCKYSCRIPT_ERROR)
                 LOG "[INFO] Dialog rejected or error. Skipping PHP installation."
-                PHP_REQUIRED=0loll
+                PHP_REQUIRED=0
                 ;;
             *)
                 if [ "$resp" = "$DUCKYSCRIPT_USER_CONFIRMED" ]; then
                     LOG "Installing PHP packages..."
                     opkg update && opkg install php8 php8-fpm php8-cgi
                     if ! opkg list-installed | grep -q php8-fpm; then
-                        LOG "[ERROR] PHP installation failed. PHP files will not work."
-                        PHP_REQUIRED=0
+                        LOG red "[ERROR] PHP installation failed. PHP files will not work."
+                        exit 1
                     else
-                        LOG "PHP installed"
-                        
-                        # Fix PHP configuration for captive portal use
-                        LOG "  Configuring PHP for captive portal..."
-                        
-                        # Disable doc_root restriction (causes "No input file specified")
-                        if grep -q '^doc_root = "/www"' /etc/php.ini 2>/dev/null; then
-                            sed -i 's/^doc_root = "\/www"/doc_root =/' /etc/php.ini
-                            LOG "  Disabled doc_root restriction in php.ini"
-                        fi
-                        
-                        # Disable cgi.force_redirect (also causes "No input file specified")
-                        mkdir -p /etc/php8
-                        cat > /etc/php8/99-custom.ini << 'PHPINI'
-cgi.force_redirect = 0
-cgi.fix_pathinfo = 1
-PHPINI
-                        LOG "  Created /etc/php8/99-custom.ini (cgi.force_redirect=0)"
+                        LOG green "[Success] PHP installed"
                     fi
                 else
-                    LOG "[INFO] Skipping PHP installation. PHP files will not work."
-                    PHP_REQUIRED=0
+                    LOG red "[ERROR] PHP installation declined. PHP files will not work."
+                    exit 1
                 fi
                 ;;
         esac
     else
         LOG "PHP-FPM already installed"
-        
-        # Apply PHP fixes even if already installed (in case they weren't applied before)
-        if [ ! -f /etc/php8/99-custom.ini ]; then
-            LOG "  Applying PHP configuration fixes..."
-            if grep -q '^doc_root = "/www"' /etc/php.ini 2>/dev/null; then
-                sed -i 's/^doc_root = "\/www"/doc_root =/' /etc/php.ini
-                LOG "  Disabled doc_root restriction in php.ini"
-            fi
-            mkdir -p /etc/php8
-            cat > /etc/php8/99-custom.ini << 'PHPINI'
-cgi.force_redirect = 0
-cgi.fix_pathinfo = 1
-PHPINI
-            LOG "  Created /etc/php8/99-custom.ini"
-        fi
     fi
+
+    configure_php
 fi
 
 
@@ -243,7 +239,7 @@ if [ "$PHP_REQUIRED" -eq 1 ]; then
         chmod 644 $PORTAL_ROOT/captiveportal/index.php
         LOG "  Installed credential capture handler"
     else
-        LOG "  ERROR: captiveportal.php not found in payload directory"
+        LOG red "  [ERROR]: captiveportal.php not found in payload directory"
         exit 1
     fi
 fi
@@ -304,7 +300,7 @@ if [ "$PHP_REQUIRED" -eq 1 ]; then
             alias $PORTAL_ROOT/captiveportal/;
             index index.php;
             location ~ \.php\$ {
-                fastcgi_pass unix:/var/run/php8-fpm.sock;
+                fastcgi_pass unix:$FPM_SOCK;
                 fastcgi_index index.php;
                 include fastcgi_params;
                 fastcgi_param SCRIPT_FILENAME \$request_filename;
@@ -381,7 +377,7 @@ if [ "$PHP_REQUIRED" -eq 1 ]; then
         SOCK=$(ls /var/run/php*fpm*.sock | head -1)
         LOG "  PHP-FPM socket found: $SOCK"
     else
-        LOG "  WARNING: PHP-FPM socket not found!"
+        LOG yellow "  [WARNING]: PHP-FPM socket not found!"
     fi
 fi
 
@@ -394,7 +390,7 @@ sleep 1
 # Validate nginx configuration before starting
 LOG "Validating nginx configuration..."
 if ! nginx -t 2>&1 | grep -q "test is successful"; then
-    LOG "[ERROR] nginx configuration test failed!"
+    LOG red "[ERROR] nginx configuration test failed!"
     nginx -t 2>&1 | while read line; do LOG "  $line"; done
     
     # Restore backup if validation fails
@@ -490,17 +486,17 @@ dnsmasq --no-hosts --no-resolv --address=/#/${PORTAL_IP} -p 1053 --listen-addres
 DNS_PID=$!
 echo "$DNS_PID" > /tmp/goodportal-dns.pid
 
-LOG "SUCCESS: DNS hijacking active (PID: $DNS_PID)"
+LOG green "SUCCESS: DNS hijacking active (PID: $DNS_PID)"
 
 LOG "Enabling IP forwarding..."
 echo 1 > /proc/sys/net/ipv4/ip_forward
-LOG "SUCCESS: IP forwarding enabled"
+LOG green "SUCCESS: IP forwarding enabled"
 
 LOG "Disabling IPv6 on br-lan..."
 # Android may bypass our IPv4-only captive portal rules
 # Disable IPv6 temporarily to force all traffic through IPv4 hijacking
 sysctl -w net.ipv6.conf.br-lan.disable_ipv6=1 2>/dev/null || LOG "  IPv6 already disabled or not available"
-LOG "SUCCESS: IPv6 disabled on br-lan"
+LOG green "SUCCESS: IPv6 disabled on br-lan"
 
 LOG "Starting whitelist monitor..."
 # Copy whitelist monitor script from payload directory
@@ -509,7 +505,7 @@ if [ -f "$PAYLOAD_DIR/whitelist_monitor.sh" ]; then
     chmod +x /tmp/goodportal_whitelist_monitor.sh
     LOG "  Installed whitelist monitor script"
 else
-    LOG "  ERROR: whitelist_monitor.sh not found in payload directory"
+    LOG red "  [ERROR]: whitelist_monitor.sh not found in payload directory"
     exit 1
 fi
 
@@ -526,54 +522,54 @@ fi
 /tmp/goodportal_whitelist_monitor.sh &
 MONITOR_PID=$!
 echo "$MONITOR_PID" > /tmp/goodportal-whitelist.pid
-LOG "SUCCESS: Whitelist monitor active (PID: $MONITOR_PID)"
+LOG green "SUCCESS: Whitelist monitor active (PID: $MONITOR_PID)"
 
 LOG "Verifying portal..."
 
-# Test HTTP response on port 80
+# Test root path
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:80/)
 if [ "$HTTP_CODE" = "200" ]; then
-    LOG "SUCCESS: Portal responding on port 80! (HTTP $HTTP_CODE)"
+    LOG green "SUCCESS: Portal root responding on port 80! (HTTP $HTTP_CODE)"
 elif [ "$HTTP_CODE" = "403" ]; then
-    LOG "ERROR: Portal returned 403 Forbidden - checking permissions..."
+    LOG red "ERROR: Portal returned 403 Forbidden - checking permissions..."
     ls -la "$PORTAL_ROOT/$SELECTED_DIR" 2>&1 | head -5 | while read line; do LOG "  $line"; done
     nginx -T 2>&1 | grep -A 20 "server {" | head -25 | while read line; do LOG "  $line"; done
     exit 1
 else
-    LOG "ERROR: Portal returned HTTP $HTTP_CODE on port 80 (expected 200)"
-    exit 1
+    LOG yellow "[WARNING]: Portal root returned HTTP $HTTP_CODE (expected 200)"
 fi
 
-# Verify port 80 is listening
-if netstat -plant 2>/dev/null | grep -q ':80'; then
-    PORT80_SERVICE=$(netstat -plant 2>/dev/null | grep ':80' | awk '{print $NF}' | head -1)
-    LOG "SUCCESS: Service listening on port 80: $PORT80_SERVICE"
+# Test non-existent page to verify @fallback location works
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:80/nonexistent-page-test-12345)
+if [ "$HTTP_CODE" = "200" ]; then
+    LOG green "SUCCESS: 404 fallback working (redirects to index, HTTP $HTTP_CODE)"
+elif [ "$HTTP_CODE" = "404" ]; then
+    LOG yellow "[WARNING]: 404 not redirecting to index (HTTP $HTTP_CODE)"
 else
-    LOG "ERROR: No service listening on port 80!"
-    exit 1
+    LOG yellow "[WARNING]: Non-existent page returned HTTP $HTTP_CODE"
 fi
 
 # Verify PHP-FPM if needed
 if [ "$PHP_REQUIRED" -eq 1 ]; then
     if netstat -plant 2>/dev/null | grep -q 'php.*fpm' || ls -la /var/run/php*fpm.sock >/dev/null 2>&1; then
-        LOG "SUCCESS: PHP-FPM is running"
+        LOG green "SUCCESS: PHP-FPM is running"
     else
-        LOG "WARNING: PHP-FPM does not appear to be running"
+        LOG red "ERROR: PHP-FPM does not appear to be running"
         exit 1
     fi
 fi
 
 if ! netstat -plant 2>/dev/null | grep -q ':1053'; then
-    LOG "ERROR: DNS hijack not active"
+    LOG red "ERROR: DNS hijack not active"
     exit 1
 fi
 
 # Verify firewall rules 
 RULE_COUNT=$(uci show firewall | grep -c "GoodPortal.*lan")
 if [ "$RULE_COUNT" -eq 3 ]; then
-    LOG "SUCCESS: All 3 firewall rules configured!"
+    LOG green "SUCCESS: All 3 firewall rules configured!"
 else
-    LOG "ERROR: Expected 3 firewall rules, found $RULE_COUNT"
+    LOG red "ERROR: Expected 3 firewall rules, found $RULE_COUNT"
     exit 1
 fi
 
